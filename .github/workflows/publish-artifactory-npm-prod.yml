@@ -1,0 +1,86 @@
+name: Artifactory npm publisher (prod)
+run-name: npm prod ${{ inputs.operation }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Registry operation
+        required: true
+        type: choice
+        default: publish
+        options: [publish, dist-tag-add, dist-tag-remove]
+      package_name:
+        description: Bare npm package name, without scope
+        required: true
+        type: string
+      scope:
+        description: Optional scope WITHOUT @
+        required: false
+        default: ''
+        type: string
+      version:
+        description: Exact version for publish or tag addition; unused for tag removal
+        required: false
+        default: ''
+        type: string
+      dist_tag:
+        description: Publication or standalone distribution tag
+        required: true
+        default: latest
+        type: string
+      operation_id:
+        description: Opaque public correlation ID from the caller
+        required: true
+        type: string
+
+permissions: {}
+
+# Package-wide grouping includes all operations and versions. The caller owns
+# durable ordering and recovery when this bounded queue fills or a run fails.
+concurrency:
+  group: npmjs:${{ inputs.scope }}:${{ inputs.package_name }}
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Configure this environment to allow ONLY protected main before onboarding.
+    # Set the same environment name in each npm trusted-publisher configuration.
+    environment: npmjs-prod
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out publisher implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up supported Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install reviewed worker dependencies and pinned npm CLI
+        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+
+      - name: Validate operation, download with Artifactory OIDC, and write with npm OIDC
+        env:
+          PUBLISHER_STAGE: prod
+          # Confidential endpoint configuration; no long-lived registry tokens.
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_OIDC_URL: ${{ secrets.ARTIFACTORY_OIDC_URL }}
+          ARTIFACTORY_OIDC_AUDIENCE: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE }}
+          OPERATION: ${{ inputs.operation }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          PACKAGE_SCOPE: ${{ inputs.scope }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+          DIST_TAG: ${{ inputs.dist_tag }}
+          OPERATION_ID: ${{ inputs.operation_id }}
+        run: node .github/scripts/publisher.js
