@@ -8,8 +8,9 @@
     "node": "^24.15.0 || >=26.0.0"
   },
   "scripts": {
+    "onboard": "bash scripts/onboard-package.sh",
     "test": "node --test test/*.test.js",
-    "check": "node --check .github/scripts/publisher.js && node --check .github/scripts/check-workflows.js && node .github/scripts/check-workflows.js"
+    "check": "bash -n scripts/onboard-package.sh && node --check .github/scripts/publisher.js && node --check .github/scripts/check-workflows.js && node .github/scripts/check-workflows.js"
   },
   "dependencies": {
     "semver": "7.8.5"

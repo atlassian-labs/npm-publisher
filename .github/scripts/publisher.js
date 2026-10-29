@@ -13,7 +13,7 @@ const pacote = createRequire(join(npmRoot, 'package.json'))('pacote');
 export const REGISTRY = 'https://registry.npmjs.org/';
 export const MAIN_REF = 'refs/heads/main';
 export const DEPLOYMENTS = {
-  prod: { workflow: 'publish-artifactory-npm-prod.yml', environment: 'npmjs-prod' },
+  prod: { workflow: 'publish-npm.yml', environment: 'npmjs-prod' },
   staging: { workflow: 'publish-artifactory-npm-staging.yml', environment: 'npmjs-staging' },
 };
 

@@ -137,7 +137,7 @@ async function sourceFiles(directory) {
     const path = `${directory}/${entry.name}`;
     if (entry.isDirectory()) result.push(...(await sourceFiles(path)));
     else if (
-      /\.(?:js|json|md|ya?ml)$/.test(entry.name) &&
+      /\.(?:js|sh|json|md|ya?ml)$/.test(entry.name) &&
       !entry.name.endsWith('.local.json')
     )
       result.push(path);
@@ -163,6 +163,7 @@ async function main() {
     'package.json',
     'package-lock.json',
     ...(await sourceFiles('.github')),
+    ...(await sourceFiles('scripts')),
     ...(await sourceFiles('test')),
   ];
   for (const file of paths) checkPublicText(await readFile(file, 'utf8'), file);

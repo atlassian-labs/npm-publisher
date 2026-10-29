@@ -5,7 +5,7 @@ Both workflows accept any valid package name with npm trusted-publisher authoriz
 
 | Stage      | Workflow                              | Protected environment | Default tag |
 | ---------- | ------------------------------------- | --------------------- | ----------- |
-| Production | `publish-artifactory-npm-prod.yml`    | `npmjs-prod`          | `latest`    |
+| Production | `publish-npm.yml`    | `npmjs-prod`          | `latest`    |
 | Staging    | `publish-artifactory-npm-staging.yml` | `npmjs-staging`       | `oidc-test` |
 
 Both use `ubuntu-latest` and `main`, and write to the real npmjs registry.
@@ -58,6 +58,52 @@ Publication preserves the original tarball. npm provenance requires its
 `repository.url` to match the public GitHub publisher repository; npm verifies
 source identity when accepting publication. Test representative packages before
 adopting a central publisher. [npm provenance requirements](https://docs.npmjs.com/generating-provenance-statements/#prerequisites)
+
+## Onboard a new package
+
+Build the package first, then run from this repository with npm 11.15+ and an
+npm account with 2FA and permission to publish the package:
+
+```sh
+bash scripts/onboard-package.sh /path/to/package
+```
+
+The Bash script (compatible with macOS Bash 3.2) first displays the package name,
+scope, version, registry and **public** visibility. Type `y` or `yes` to continue;
+Enter, EOF or any other answer cancels before login or publication. This flow
+supports public packages only: `private: true` and restricted `publishConfig.access`
+are rejected rather than overridden.
+
+After confirmation, the script opens an interactive npm login and displays the
+signed-in account and its 2FA status. Disabled or unverifiable 2FA stops publication
+and triggers logout. A successful login alone does not satisfy npm's publishing
+requirements; enable 2FA in npm Account settings and complete any publish-time
+browser approval. The script then publishes the package publicly to npmjs and uses
+[`npm trust`](https://docs.npmjs.com/cli/v12/commands/npm-trust/)
+to authorize `atlassian-labs/artifactory-npm-publisher` with
+`publish-npm.yml` and its `npmjs-prod` environment.
+The script accepts only the package directory. Lifecycle scripts are disabled,
+so include all built files before running. The path must be the package to publish,
+not this private publisher repository.
+
+Credentials and cache use a temporary directory. Cleanup calls
+[`npm logout`](https://docs.npmjs.com/cli/v12/commands/npm-logout/) to revoke that
+login and removes the directory on success, failure, Ctrl-C or SIGTERM. Existing
+npm credentials are untouched. A failed logout reports that server-side revocation
+is unconfirmed; a forced kill or power loss cannot run cleanup.
+
+If publishing succeeds but trust setup fails, the version stays published.
+Configure its trusted publisher in npm package settings instead of rerunning the
+publish. To finish onboarding, enable **Allow npm dist-tag** in the package's
+trusted publisher settings for `publish-npm.yml` / `npmjs-prod`, keeping
+**Allow npm publish** enabled. npm 12.2.1 cannot grant dist-tag permission through
+`npm trust`, so the script prints this required manual step. Existing connections
+cannot be edited: recreate the connection with the same repository, workflow and
+environment, selecting both permissions ([npm permissions](https://docs.npmjs.com/trusted-publishers/#managing-dist-tags-with-trusted-publishing)).
+Publish the next version through the OIDC workflow within **2 days** to validate
+the new trust configuration before it expires ([npm expiry rules](https://docs.npmjs.com/trusted-publishers/#trusted-publisher-configuration-expiry)).
+The initial manual publish does not validate this trust. The pilot must also
+verify the provenance requirements described above.
 
 ## Dispatch and completion
 
