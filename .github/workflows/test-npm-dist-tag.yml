@@ -1,11 +1,16 @@
 name: Test npm dist-tag with OIDC
-run-name: Tag test3@${{ inputs.version }} as ${{ inputs.dist_tag }}
+run-name: Tag ${{ inputs.package_name }}@${{ inputs.version }} as ${{ inputs.dist_tag }}
 
 on:
   workflow_dispatch:
     inputs:
+      package_name:
+        description: npm package name, including scope if applicable
+        required: true
+        default: tungnguyen-atl-tung-test3
+        type: string
       version:
-        description: Existing version of tungnguyen-atl-tung-test3
+        description: Existing package version
         required: true
         default: '0.0.0'
         type: string
@@ -18,7 +23,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: npmjs::tungnguyen-atl-tung-test3
+  group: npmjs::${{ inputs.package_name }}
   queue: max
   cancel-in-progress: false
 
@@ -32,7 +37,7 @@ jobs:
       contents: read
       id-token: write
     env:
-      PACKAGE_NAME: tungnguyen-atl-tung-test3
+      PACKAGE_NAME: ${{ inputs.package_name }}
       PACKAGE_VERSION: ${{ inputs.version }}
       DIST_TAG: ${{ inputs.dist_tag }}
     steps:
