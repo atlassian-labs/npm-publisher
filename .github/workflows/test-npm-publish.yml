@@ -1,0 +1,83 @@
+name: Test npm publish from Artifactory staging
+run-name: Publish ${{ inputs.package_name }}@${{ inputs.version }} as ${{ inputs.dist_tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: npm package name, including scope
+        required: true
+        default: '@atlassian-test-staging/synth-check'
+        type: string
+      version:
+        description: Version to download from staging and publish to npm
+        required: true
+        type: string
+      dist_tag:
+        description: npm distribution tag
+        required: true
+        default: oidc-test
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npmjs-staging
+    permissions:
+      id-token: write
+    env:
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      PACKAGE_VERSION: ${{ inputs.version }}
+      DIST_TAG: ${{ inputs.dist_tag }}
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Install npm
+        run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+
+      - name: Download package from Artifactory staging using OIDC
+        shell: bash
+        env:
+          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
+          ARTIFACTORY_OIDC_URL: ${{ secrets.ARTIFACTORY_OIDC_URL }}
+          ARTIFACTORY_OIDC_AUDIENCE: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE }}
+        run: |
+          [[ "$PACKAGE_NAME" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]
+          [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
+
+          oidc_url="$ACTIONS_ID_TOKEN_REQUEST_URL"
+          if [[ -n "$ARTIFACTORY_OIDC_AUDIENCE" ]]; then
+            oidc_url="$oidc_url&audience=$(jq -rn --arg audience "$ARTIFACTORY_OIDC_AUDIENCE" '$audience | @uri')"
+          fi
+          id_token=$(curl -fsS --proto '=https' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$oidc_url" | jq -er '.value')
+          printf '::add-mask::%s\n' "$id_token"
+          credentials=$(curl -fsS --proto '=https' -X POST "$ARTIFACTORY_OIDC_URL" \
+            -H "Authorization: Bearer $id_token" -H 'Content-Type: application/json' --data 'null')
+          username=$(jq -er '.username' <<< "$credentials")
+          token=$(jq -er '.token' <<< "$credentials")
+          authorization=$(printf '%s:%s' "$username" "$token" | base64 -w 0)
+          printf '::add-mask::%s\n' "$username" "$token" "$authorization"
+
+          curl -fsS --proto '=https' -H "Authorization: Basic $authorization" \
+            "${ARTIFACTORY_BASE_URL%/}/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz" \
+            --output "$RUNNER_TEMP/npm-test-package.tgz"
+
+      - name: Check package and publish to npm using OIDC
+        shell: bash
+        run: |
+          tar -xOf "$RUNNER_TEMP/npm-test-package.tgz" package/package.json |
+            jq -e --arg name "$PACKAGE_NAME" --arg version "$PACKAGE_VERSION" --arg tag "$DIST_TAG" \
+              '.name == $name and .version == $version and ((.tag // $tag) == $tag)' > /dev/null
+          npm publish "$RUNNER_TEMP/npm-test-package.tgz" --tag="$DIST_TAG" --access=public \
+            --ignore-scripts --registry=https://registry.npmjs.org/
+
+      - name: Clean up downloaded package
+        if: always()
+        run: rm -f "$RUNNER_TEMP/npm-test-package.tgz"
