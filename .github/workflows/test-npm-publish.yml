@@ -60,8 +60,16 @@ jobs:
           id_token=$(curl -fsS --proto '=https' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$oidc_url" | jq -er '.value')
           printf '::add-mask::%s\n' "$id_token"
           echo "Exchanging token with Artifactory OIDC"
-          credentials=$(curl -fsS --proto '=https' -X POST "$ARTIFACTORY_OIDC_URL" \
-            -H "Authorization: Bearer $id_token" -H 'Content-Type: application/json' --data 'null')
+          response=$(curl -sS --proto '=https' -X POST "$ARTIFACTORY_OIDC_URL" \
+            -H "Authorization: Bearer $id_token" -H 'Content-Type: application/json' --data 'null' \
+            --write-out $'\n%{http_code}')
+          http_status="${response##*$'\n'}"
+          credentials="${response%$'\n'*}"
+          if [[ "$http_status" != 200 ]]; then
+            printf 'Artifactory OIDC exchange failed (HTTP %s)\n' "$http_status"
+            jq -r '.error // .message // "No JSON error message"' <<< "$credentials" 2>/dev/null || echo "Non-JSON error response"
+            exit 1
+          fi
           username=$(jq -er '.username' <<< "$credentials")
           token=$(jq -er '.token' <<< "$credentials")
           authorization=$(printf '%s:%s' "$username" "$token" | base64 -w 0)
