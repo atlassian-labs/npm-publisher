@@ -42,42 +42,28 @@ jobs:
       - name: Install npm
         run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
 
-      - name: Download package from Artifactory staging using OIDC
+      - name: Authenticate with Artifactory staging
+        id: jfrog
+        uses: jfrog/setup-jfrog-cli@29fa5190a4123350e81e2a2e8d803b2a27fed15e
+        env:
+          JF_URL: ${{ secrets.JF_URL }}
+        with:
+          oidc-provider-name: github
+          oidc-audience: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE }}
+          disable-job-summary: true
+          disable-auto-build-publish: true
+
+      - name: Download package from Artifactory staging
         shell: bash
         env:
           ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
-          ARTIFACTORY_OIDC_URL: ${{ secrets.ARTIFACTORY_OIDC_URL }}
-          ARTIFACTORY_OIDC_AUDIENCE: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE }}
+          ARTIFACTORY_ACCESS_TOKEN: ${{ steps.jfrog.outputs.oidc-token }}
         run: |
           [[ "$PACKAGE_NAME" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]
           [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
 
-          oidc_url="$ACTIONS_ID_TOKEN_REQUEST_URL"
-          if [[ -n "$ARTIFACTORY_OIDC_AUDIENCE" ]]; then
-            oidc_url="$oidc_url&audience=$(jq -rn --arg audience "$ARTIFACTORY_OIDC_AUDIENCE" '$audience | @uri')"
-          fi
-          echo "Requesting GitHub OIDC token"
-          id_token=$(curl -fsS --proto '=https' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$oidc_url" | jq -er '.value')
-          printf '::add-mask::%s\n' "$id_token"
-          echo "Exchanging token with Artifactory OIDC"
-          response=$(curl -sS --proto '=https' -X POST "$ARTIFACTORY_OIDC_URL" \
-            -H "Authorization: Bearer $id_token" -H 'Content-Type: application/json' --data 'null' \
-            --write-out $'\n%{http_code}')
-          http_status="${response##*$'\n'}"
-          credentials="${response%$'\n'*}"
-          if [[ "$http_status" != 200 ]]; then
-            printf 'Artifactory OIDC exchange failed (HTTP %s)\n' "$http_status"
-            jq -r '.error // .message // "No JSON error message"' <<< "$credentials" 2>/dev/null || echo "Non-JSON error response"
-            exit 1
-          fi
-          username=$(jq -er '.username' <<< "$credentials")
-          token=$(jq -er '.token' <<< "$credentials")
-          authorization=$(printf '%s:%s' "$username" "$token" | base64 -w 0)
-          printf '::add-mask::%s\n' "$username" "$token" "$authorization"
-
-          echo "Downloading package tarball from Artifactory staging"
           package_path="${PACKAGE_NAME//@/%40}"
-          curl -fsS --proto '=https' -H "Authorization: Basic $authorization" \
+          curl -fsS --proto '=https' -H "Authorization: Bearer $ARTIFACTORY_ACCESS_TOKEN" \
             "${ARTIFACTORY_BASE_URL%/}/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz" \
             --output "$RUNNER_TEMP/npm-test-package.tgz"
 
