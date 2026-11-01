@@ -56,8 +56,10 @@ jobs:
           if [[ -n "$ARTIFACTORY_OIDC_AUDIENCE" ]]; then
             oidc_url="$oidc_url&audience=$(jq -rn --arg audience "$ARTIFACTORY_OIDC_AUDIENCE" '$audience | @uri')"
           fi
+          echo "Requesting GitHub OIDC token"
           id_token=$(curl -fsS --proto '=https' -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$oidc_url" | jq -er '.value')
           printf '::add-mask::%s\n' "$id_token"
+          echo "Exchanging token with Artifactory OIDC"
           credentials=$(curl -fsS --proto '=https' -X POST "$ARTIFACTORY_OIDC_URL" \
             -H "Authorization: Bearer $id_token" -H 'Content-Type: application/json' --data 'null')
           username=$(jq -er '.username' <<< "$credentials")
@@ -65,8 +67,10 @@ jobs:
           authorization=$(printf '%s:%s' "$username" "$token" | base64 -w 0)
           printf '::add-mask::%s\n' "$username" "$token" "$authorization"
 
+          echo "Downloading package tarball from Artifactory staging"
+          package_path="${PACKAGE_NAME//@/%40}"
           curl -fsS --proto '=https' -H "Authorization: Basic $authorization" \
-            "${ARTIFACTORY_BASE_URL%/}/${PACKAGE_NAME}/-/${PACKAGE_NAME}-${PACKAGE_VERSION}.tgz" \
+            "${ARTIFACTORY_BASE_URL%/}/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz" \
             --output "$RUNNER_TEMP/npm-test-package.tgz"
 
       - name: Check package and publish to npm using OIDC
