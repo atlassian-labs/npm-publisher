@@ -64,8 +64,10 @@ jobs:
 
           : "${ARTIFACTORY_ACCESS_TOKEN:?Artifactory OIDC authentication returned no access token}"
           package_path="${PACKAGE_NAME//@/%40}"
+          package_url="${ARTIFACTORY_BASE_URL%/}/artifactory/npm-public/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz"
+          echo "Downloading package from: $package_url"
           curl -fsS --proto '=https' -H "Authorization: Bearer $ARTIFACTORY_ACCESS_TOKEN" \
-            "${ARTIFACTORY_BASE_URL%/}/artifactory/npm-public/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz" \
+            "$package_url" \
             --output "$RUNNER_TEMP/npm-test-package.tgz"
 
       - name: Check package and publish to npm using OIDC
