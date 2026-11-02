@@ -1,4 +1,4 @@
-name: Test npm publish from Artifactory staging
+name: Test npm publish from Artifactory
 run-name: Publish ${{ inputs.package_name }}@${{ inputs.version }} as ${{ inputs.dist_tag }}
 
 on:
@@ -7,10 +7,10 @@ on:
       package_name:
         description: npm package name, including scope
         required: true
-        default: '@atlassian-test-staging/synth-check'
+        default: '@atlassian-test-prod/synth-check'
         type: string
       version:
-        description: Version to download from staging and publish to npm
+        description: Version to download from Artifactory and publish to npm
         required: true
         type: string
       dist_tag:
@@ -25,13 +25,13 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: npmjs-staging
     permissions:
       id-token: write
     env:
       PACKAGE_NAME: ${{ inputs.package_name }}
       PACKAGE_VERSION: ${{ inputs.version }}
       DIST_TAG: ${{ inputs.dist_tag }}
+      ARTIFACTORY_BASE_URL: ${{ vars.ARTIFACTORY_BASE_URL }}
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
@@ -42,29 +42,30 @@ jobs:
       - name: Install npm
         run: npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
 
-      - name: Authenticate with Artifactory staging
+      - name: Authenticate with Artifactory
         id: jfrog
-        uses: jfrog/setup-jfrog-cli@29fa5190a4123350e81e2a2e8d803b2a27fed15e
+        uses: jfrog/setup-jfrog-cli@6ed45ef1a24199bd4c94d3fd55a7e8cb7e45985d # v5.3.2
         env:
-          JF_URL: ${{ secrets.JF_URL }}
+          JF_URL: ${{ env.ARTIFACTORY_BASE_URL }}
         with:
           oidc-provider-name: github
-          oidc-audience: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE }}
+          oidc-audience: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE || 'packages.atlassian.com' }}
           disable-job-summary: true
           disable-auto-build-publish: true
+          disable-auto-evidence-collection: true
 
-      - name: Download package from Artifactory staging
+      - name: Download package from Artifactory
         shell: bash
         env:
-          ARTIFACTORY_BASE_URL: ${{ secrets.ARTIFACTORY_BASE_URL }}
           ARTIFACTORY_ACCESS_TOKEN: ${{ steps.jfrog.outputs.oidc-token }}
         run: |
           [[ "$PACKAGE_NAME" =~ ^(@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*$ ]]
           [[ "$PACKAGE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]
 
+          : "${ARTIFACTORY_ACCESS_TOKEN:?Artifactory OIDC authentication returned no access token}"
           package_path="${PACKAGE_NAME//@/%40}"
           curl -fsS --proto '=https' -H "Authorization: Bearer $ARTIFACTORY_ACCESS_TOKEN" \
-            "${ARTIFACTORY_BASE_URL%/}/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz" \
+            "${ARTIFACTORY_BASE_URL%/}/artifactory/npm-public/${package_path}/-/${package_path}-${PACKAGE_VERSION}.tgz" \
             --output "$RUNNER_TEMP/npm-test-package.tgz"
 
       - name: Check package and publish to npm using OIDC
