@@ -70,12 +70,13 @@ jobs:
             "$package_url" \
             --output "$RUNNER_TEMP/npm-test-package.tgz"
 
-      - name: Check package and publish to npm using OIDC
+      - name: Check package, unpublish and publish to npm
         shell: bash
         run: |
           tar -xOf "$RUNNER_TEMP/npm-test-package.tgz" package/package.json |
             jq -e --arg name "$PACKAGE_NAME" --arg version "$PACKAGE_VERSION" --arg tag "$DIST_TAG" \
               '.name == $name and .version == $version and ((.tag // $tag) == $tag)' > /dev/null
+          npm unpublish "$PACKAGE_NAME@$PACKAGE_VERSION" --registry=https://registry.npmjs.org/
           npm publish "$RUNNER_TEMP/npm-test-package.tgz" --tag="$DIST_TAG" --access=public \
             --ignore-scripts --registry=https://registry.npmjs.org/
 
