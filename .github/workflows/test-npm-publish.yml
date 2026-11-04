@@ -76,7 +76,13 @@ jobs:
           tar -xOf "$RUNNER_TEMP/npm-test-package.tgz" package/package.json |
             jq -e --arg name "$PACKAGE_NAME" --arg version "$PACKAGE_VERSION" --arg tag "$DIST_TAG" \
               '.name == $name and .version == $version and ((.tag // $tag) == $tag)' > /dev/null
-          npm unpublish "$PACKAGE_NAME@$PACKAGE_VERSION" --registry=https://registry.npmjs.org/
+          unpublish_status=0
+          unpublish_response=$(npm unpublish "$PACKAGE_NAME@$PACKAGE_VERSION" --registry=https://registry.npmjs.org/ 2>&1) || unpublish_status=$?
+          printf '%s\n' "$unpublish_response"
+          printf 'npm unpublish exit code: %s\n' "$unpublish_status"
+          if (( unpublish_status != 0 )); then
+            exit "$unpublish_status"
+          fi
           npm publish "$RUNNER_TEMP/npm-test-package.tgz" --tag="$DIST_TAG" --access=public \
             --ignore-scripts --registry=https://registry.npmjs.org/
 
