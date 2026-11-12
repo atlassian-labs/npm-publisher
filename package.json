@@ -13,7 +13,7 @@
     "check": "bash -n scripts/onboard-package.sh && node --check .github/scripts/publisher.js && node --check .github/scripts/check-workflows.js && node .github/scripts/check-workflows.js"
   },
   "dependencies": {
-    "semver": "7.8.5"
+    "semver": "7.8.6"
   },
   "devDependencies": {
     "npm": "12.2.1",
