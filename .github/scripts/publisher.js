@@ -126,20 +126,18 @@ async function writeToNpm(request, tarball) {
   if (name.startsWith('@')) options.push(`--${name.split('/')[0]}:registry=${registry}`);
   if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag }))
     return 'skipped';
+  const runNpm = async args => {
+    console.log('npm', ...args);
+    await run('npm', args, { timeout: 300_000, maxBuffer: 2 * 1024 * 1024 });
+  };
   try {
-    // The caller must reconcile uncertain writes before retrying.
-    await run('npm', [...commands[operation], ...options], {
-      timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
-    });
+    await runNpm([...commands[operation], ...options]);
     if (publishWithoutTag) {
-      await run('npm', ['dist-tag', 'rm', name, temporaryTag, ...options], {
-        timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
-      });
+      await runNpm(['dist-tag', 'rm', name, temporaryTag, ...options]);
     }
     return 'completed';
   } catch (error) {
-    const code = String(error.stderr || '').match(/npm error code ([A-Z0-9_]+)/)?.[1] || 'UNKNOWN';
-    throw new Error(`npm failed (${code}); reconcile the operation before retrying.`);
+    throw new Error(error.stderr?.trim() || error.message);
   }
 }
 

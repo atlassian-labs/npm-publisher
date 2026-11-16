@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const script = resolve('.github/scripts/publisher.js');
+const parseReceipt = stdout => JSON.parse(stdout.trim().split('\n').at(-1));
 
 // Run the production helper, replacing only network and npm process effects.
 async function removeTag({ version = '1.2.3', body = '{"beta":"1.2.3"}', status = 200,
@@ -61,8 +62,8 @@ test('versioned tag removal checks the current target immediately before writing
     redirect: 'error', hasSignal: true });
   assert.equal(result.effects[1].command, 'npm');
   assert.deepEqual(result.effects[1].args.slice(0, 4), ['dist-tag', 'rm', '@example/widget', 'beta']);
-  assert.equal(JSON.parse(result.stdout).status, 'completed');
-  assert.equal(JSON.parse(result.stdout).version, '1.2.3');
+  assert.equal(parseReceipt(result.stdout).status, 'completed');
+  assert.equal(parseReceipt(result.stdout).version, '1.2.3');
   assert.deepEqual(result.remaining, []);
 });
 
@@ -71,7 +72,7 @@ test('moved or absent tags skip removal and report a truthful successful receipt
     const result = await removeTag(fixture);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
-    assert.equal(JSON.parse(result.stdout).status, 'skipped');
+    assert.equal(parseReceipt(result.stdout).status, 'skipped');
     assert.match(result.summary, /"status": "skipped"/);
     assert.deepEqual(result.remaining, []);
   }
@@ -100,7 +101,7 @@ test('unversioned manual removal keeps direct removal without a registry prechec
   const result = await removeTag({ version: '' });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.effects.map(effect => effect.type), ['write']);
-  assert.equal(JSON.parse(result.stdout).status, 'completed');
-  assert(!Object.hasOwn(JSON.parse(result.stdout), 'version'));
+  assert.equal(parseReceipt(result.stdout).status, 'completed');
+  assert(!Object.hasOwn(parseReceipt(result.stdout), 'version'));
   assert.deepEqual(result.remaining, []);
 });
