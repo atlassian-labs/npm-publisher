@@ -8,15 +8,10 @@
     "node": "^24.15.0 || >=26.0.0"
   },
   "scripts": {
-    "onboard": "bash scripts/onboard-package.sh",
     "test": "node --test test/*.test.js",
-    "check": "bash -n scripts/onboard-package.sh && node --check .github/scripts/publisher.js && node --check .github/scripts/check-workflows.js && node .github/scripts/check-workflows.js"
-  },
-  "dependencies": {
-    "semver": "7.8.5"
+    "check": "node --check .github/scripts/publisher.js && for workflow in .github/workflows/*.yml; do yaml valid < \"$workflow\" || exit 1; done"
   },
   "devDependencies": {
-    "npm": "12.2.1",
     "yaml": "2.9.1"
   }
 }

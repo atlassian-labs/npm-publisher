@@ -1,280 +1,170 @@
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import semver from 'semver';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 
-const require = createRequire(import.meta.url);
-const npmRoot = dirname(require.resolve('npm/package.json'));
-const pacote = createRequire(join(npmRoot, 'package.json'))('pacote');
+const run = promisify(execFile);
+const registry = 'https://registry.npmjs.org/';
+const temporaryTag = 'npm-publisher-temp';
 
-export const REGISTRY = 'https://registry.npmjs.org/';
-export const MAIN_REF = 'refs/heads/main';
-export const DEPLOYMENTS = {
-  prod: { workflow: 'publish-npm.yml', environment: 'npmjs-prod' },
-  staging: { workflow: 'publish-artifactory-npm-staging.yml', environment: 'npmjs-staging' },
-};
-
-class PublisherError extends Error {}
-const fail = (message) => {
-  throw new PublisherError(message);
-};
-
-export function readRequest(env) {
-  const stage = env.PUBLISHER_STAGE;
-  const operation = env.OPERATION;
-  if (!Object.hasOwn(DEPLOYMENTS, stage)) fail('Choose prod or staging.');
-  if (!['publish', 'dist-tag-add', 'dist-tag-remove'].includes(operation))
-    fail('Unsupported operation.');
-  const name = env.PACKAGE_NAME || '';
-  const scope = env.PACKAGE_SCOPE || '';
-  const fullName = scope ? `@${scope}/${name}` : name;
-  const namePattern = /^[a-z0-9][a-z0-9._-]*$/;
-  if (!namePattern.test(name) || (scope && !namePattern.test(scope)) || fullName.length > 214)
-    fail('Invalid package name or scope.');
-  const version = operation === 'dist-tag-remove' ? undefined : env.PACKAGE_VERSION || '';
-  if (operation !== 'dist-tag-remove' && semver.valid(version) !== version)
-    fail('An exact canonical package version is required.');
-  const tag = env.DIST_TAG || '';
-  if (!/^[a-z][a-z0-9._-]{0,127}$/.test(tag)) fail('Invalid distribution tag.');
-  const operationId = env.OPERATION_ID || '';
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(operationId))
-    fail('Invalid or missing operation_id.');
-  return { stage, operation, fullName, version, tag, operationId };
+function readRequest() {
+  const { PUBLISHER_STAGE: stage, OPERATION: operation } = process.env;
+  const name = process.env.PACKAGE_NAME || '';
+  const version = process.env.PACKAGE_VERSION || '';
+  const tag = operation === 'publish' ? undefined : process.env.DIST_TAG || '';
+  const operationId = process.env.OPERATION_ID || '';
+  if (!['prod', 'staging'].includes(stage)) throw new Error('Choose prod or staging.');
+  if (!['publish', 'dist-tag-add', 'dist-tag-remove'].includes(operation)) throw new Error('Unsupported operation.');
+  if (!/^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(name) || name.length > 214)
+    throw new Error('Invalid package name.');
+  if (operation !== 'dist-tag-remove' && !version) throw new Error('Package version is required.');
+  if (operation !== 'publish' && !/^[a-z][a-z0-9._-]{0,127}$/.test(tag)) throw new Error('Invalid distribution tag.');
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(operationId)) throw new Error('Invalid or missing operation_id.');
+  return { stage, operation, name, version, tag, operationId };
 }
 
-function httpsUrl(value, label) {
-  try {
-    const url = new URL(value);
-    if (url.protocol !== 'https:' || url.username || url.password || url.hash) throw new Error();
-    return url;
-  } catch {
-    fail(`Set ${label} to an HTTPS URL without credentials or a fragment.`);
-  }
-}
+async function downloadPackage({ name, version }, directory) {
+  const base = process.env.ARTIFACTORY_BASE_URL || '';
+  const token = process.env.ARTIFACTORY_ACCESS_TOKEN;
+  if (!token || /[\r\n]/.test(token)) throw new Error('Missing or invalid Artifactory access token.');
+  for (const value of [token, `Bearer ${token}`])
+    console.log(`::add-mask::${value.replaceAll('%', '%25')}`);
 
-export function buildDownloadUrl(request, env) {
-  const base = httpsUrl(env.ARTIFACTORY_BASE_URL, 'ARTIFACTORY_BASE_URL');
-  if (base.search) fail('ARTIFACTORY_BASE_URL must not contain a query.');
-  if (!base.pathname.endsWith('/')) base.pathname += '/';
-  return new URL(`${request.fullName}/-/${request.fullName}-${request.version}.tgz`, base);
-}
-
-async function responseBytes(url, options, fetchImpl, limit = 100 * 1024 * 1024) {
-  const response = await fetchImpl(url, {
-    ...options,
+  const packagePath = name.replaceAll('@', '%40');
+  const url = `${base.replace(/\/$/, '')}/artifactory/api/npm/npm-public/${packagePath}/-/${packagePath}-${encodeURIComponent(version)}.tgz`;
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
     redirect: 'error',
     signal: AbortSignal.timeout(180_000),
-  });
+  }).catch(() => { throw new Error('Artifact download request failed; response details suppressed.'); });
   if (!response.ok) {
-    await response.body?.cancel();
-    fail(`HTTP request failed (${response.status}); response body suppressed.`);
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Artifact download failed (HTTP ${response.status}); response suppressed.`);
   }
+  const limit = 100 * 1024 * 1024;
   if (Number(response.headers.get('content-length')) > limit) {
-    await response.body?.cancel();
-    fail('HTTP response exceeds size limit.');
+    await response.body?.cancel().catch(() => {});
+    throw new Error('Artifact exceeds the 100 MiB size limit.');
   }
   const chunks = [];
   let size = 0;
-  for await (const chunk of response.body) {
-    size += chunk.length;
-    if (size > limit) fail('HTTP response exceeds size limit.');
-    chunks.push(Buffer.from(chunk));
-  }
-  return Buffer.concat(chunks);
-}
-
-async function json(url, options, fetchImpl) {
-  return JSON.parse(
-    (await responseBytes(url, options, fetchImpl, 2 * 1024 * 1024)).toString('utf8'),
-  );
-}
-
-export function mask(value) {
-  console.log(
-    `::add-mask::${value.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')}`,
-  );
-}
-
-export async function artifactoryCredential(env, fetchImpl = fetch, maskImpl = mask) {
-  const oidcUrl = httpsUrl(env.ACTIONS_ID_TOKEN_REQUEST_URL, 'ACTIONS_ID_TOKEN_REQUEST_URL');
-  if (env.ARTIFACTORY_OIDC_AUDIENCE)
-    oidcUrl.searchParams.set('audience', env.ARTIFACTORY_OIDC_AUDIENCE);
-  const { value: idToken } = await json(
-    oidcUrl,
-    { headers: { Authorization: `Bearer ${env.ACTIONS_ID_TOKEN_REQUEST_TOKEN}` } },
-    fetchImpl,
-  );
-  if (typeof idToken !== 'string' || !idToken) fail('GitHub did not return an OIDC token.');
-  maskImpl(idToken);
-  const { username, token } = await json(
-    httpsUrl(env.ARTIFACTORY_OIDC_URL, 'ARTIFACTORY_OIDC_URL'),
-    {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-      body: 'null',
-    },
-    fetchImpl,
-  );
-  if (typeof username !== 'string' || !username || typeof token !== 'string' || !token)
-    fail('Artifactory did not return a username and token.');
-  const encoded = Buffer.from(`${username}:${token}`).toString('base64');
-  const authorization = `Basic ${encoded}`;
-  for (const secret of [username, token, encoded, authorization]) maskImpl(secret);
-  return authorization;
-}
-
-export function download(request, env, authorization, fetchImpl = fetch) {
-  return responseBytes(
-    buildDownloadUrl(request, env),
-    { headers: { Authorization: authorization } },
-    fetchImpl,
-  );
-}
-
-export function validateManifest(manifest, request) {
-  if (manifest.name !== request.fullName || manifest.version !== request.version)
-    fail('Artifact package name/version mismatch.');
-  // npm prefers a truthy top-level tag over the command-line default.
-  if (manifest.tag && manifest.tag !== request.tag)
-    fail('Artifact tag conflicts with the request.');
-  const config = manifest.publishConfig ?? {};
-  if (typeof config !== 'object' || Array.isArray(config)) fail('Invalid publishConfig.');
-  const allowed = {
-    registry: [REGISTRY, REGISTRY.slice(0, -1)],
-    tag: [request.tag],
-    access: ['public'],
-    provenance: [true],
-  };
-  for (const [key, value] of Object.entries(config)) {
-    if (!Object.hasOwn(allowed, key) || !allowed[key].includes(value))
-      fail('Artifact publishConfig conflicts with the requested publication.');
-  }
-}
-
-export function writeArguments(request, tarballPath) {
-  const { operation, fullName, version, tag } = request;
-  const commands = {
-    publish: ['publish', tarballPath, `--tag=${tag}`, '--access=public', '--provenance'],
-    'dist-tag-add': ['dist-tag', 'add', `${fullName}@${version}`, tag],
-    'dist-tag-remove': ['dist-tag', 'rm', fullName, tag],
-  };
-  return [
-    ...commands[operation],
-    `--registry=${REGISTRY}`,
-    '--ignore-scripts',
-    '--workspaces=false',
-    '--loglevel=error',
-  ];
-}
-
-export function npmEnvironment(env, directory) {
-  const clean = Object.fromEntries(
-    Object.entries(env).filter(
-      ([key]) =>
-        key !== 'GITHUB_TOKEN' &&
-        (/^(GITHUB_|RUNNER_|ACTIONS_ID_TOKEN_REQUEST_)/.test(key) ||
-          ['PATH', 'TMPDIR', 'SYSTEMROOT', 'LANG', 'CI'].includes(key)),
-    ),
-  );
-  return {
-    ...clean,
-    HOME: directory,
-    NPM_CONFIG_USERCONFIG: join(directory, 'user.npmrc'),
-    NPM_CONFIG_GLOBALCONFIG: join(directory, 'global.npmrc'),
-    NPM_CONFIG_CACHE: join(directory, 'cache'),
-    NPM_CONFIG_IGNORE_SCRIPTS: 'true',
-    NPM_CONFIG_AUDIT: 'false',
-    NPM_CONFIG_FUND: 'false',
-    NPM_CONFIG_FETCH_RETRIES: '0',
-  };
-}
-
-async function npmWrite(request, tarballPath, env, directory) {
-  const childEnv = npmEnvironment(env, directory);
-  await writeFile(childEnv.NPM_CONFIG_USERCONFIG, `registry=${REGISTRY}\nignore-scripts=true\n`, {
-    mode: 0o600,
-  });
-  await writeFile(childEnv.NPM_CONFIG_GLOBALCONFIG, '', { mode: 0o600 });
   try {
-    execFileSync(
-      process.execPath,
-      [join(npmRoot, 'bin/npm-cli.js'), ...writeArguments(request, tarballPath)],
-      {
-        cwd: directory,
-        env: childEnv,
-        timeout: 5 * 60_000,
-        maxBuffer: 2 * 1024 * 1024,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > limit) break;
+      chunks.push(chunk);
+    }
+  } catch {
+    throw new Error('Unable to read the artifact download; response details suppressed.');
+  }
+  if (size > limit) throw new Error('Artifact exceeds the 100 MiB size limit.');
+  const tarball = join(directory, 'package.tgz');
+  await writeFile(tarball, Buffer.concat(chunks), { mode: 0o600 });
+  return tarball;
+}
+
+// Artifactory publish events do not include tags, so fetch them from Artifactory.
+// Tags may move while the event is queued; select one currently pointing to this version.
+// No matching tag tells the caller to publish with a temporary tag and remove it.
+async function selectPublishTag({ name, version }) {
+  const base = (process.env.ARTIFACTORY_BASE_URL || '').replace(/\/$/, '');
+  // Read the local source repository, not tags merged by a virtual repository.
+  const response = await fetch(`${base}/artifactory/api/npm/npm-public-local/${encodeURIComponent(name)}`, {
+    headers: { Authorization: `Bearer ${process.env.ARTIFACTORY_ACCESS_TOKEN}`, 'Cache-Control': 'no-cache' },
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => { throw new Error('Artifactory tag lookup failed; response details suppressed.'); });
+  if (response.status !== 200) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Artifactory tag lookup failed (HTTP ${response.status}); response suppressed.`);
+  }
+  const metadata = await response.json().catch(() => { throw new Error('Invalid Artifactory tag response.'); });
+  const tags = metadata?.['dist-tags'];
+  if (!tags || typeof tags !== 'object' || Array.isArray(tags) ||
+      Object.values(tags).some(value => typeof value !== 'string' || !value))
+    throw new Error('Invalid Artifactory tag response.');
+  const attached = Object.keys(tags).filter(tag => tags[tag] === version);
+  if (!attached.length) return undefined;
+  return attached.find(tag => tag !== 'latest') || 'latest';
+}
+
+async function tagStillTargetsVersion({ name, version, tag }) {
+  const response = await fetch(`${registry}-/package/${encodeURIComponent(name)}/dist-tags`, {
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => { throw new Error('npm tag lookup failed; response details suppressed.'); });
+  if (response.status === 404) {
+    await response.body?.cancel().catch(() => {});
+    return false;
+  }
+  if (response.status !== 200) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`npm tag lookup failed (HTTP ${response.status}); response suppressed.`);
+  }
+  const tags = await response.json().catch(() => { throw new Error('Invalid npm tag lookup response.'); });
+  if (!tags || typeof tags !== 'object' || Array.isArray(tags))
+    throw new Error('Invalid npm tag lookup response.');
+  const current = Object.hasOwn(tags, tag) ? tags[tag] : undefined;
+  if (current !== undefined && (typeof current !== 'string' || !current))
+    throw new Error('Invalid npm tag lookup response.');
+  return current === version;
+}
+
+async function writeToNpm(request, tarball) {
+  if (request.operation === 'publish') request.tag = await selectPublishTag(request);
+  const { operation, name, version, tag } = request;
+  // npm always publishes with a tag; remove the temporary tag after an untagged publish.
+  const publishWithoutTag = operation === 'publish' && !tag;
+  if (publishWithoutTag) console.log(`No Artifactory tag points to this version; publishing with temporary tag ${temporaryTag}, then removing it.`);
+  const commands = {
+    publish: ['publish', tarball, `--tag=${tag || temporaryTag}`, '--access=public', '--provenance'],
+    'dist-tag-add': ['dist-tag', 'add', `${name}@${version}`, tag],
+    'dist-tag-remove': ['dist-tag', 'rm', name, tag],
+  };
+  const options = [`--registry=${registry}`, '--ignore-scripts', '--workspaces=false', '--loglevel=error'];
+  if (name.startsWith('@')) options.push(`--${name.split('/')[0]}:registry=${registry}`);
+  if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag }))
+    return 'skipped';
+  try {
+    // The caller must reconcile uncertain writes before retrying.
+    await run('npm', [...commands[operation], ...options], {
+      timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
+    });
+    if (publishWithoutTag) {
+      await run('npm', ['dist-tag', 'rm', name, temporaryTag, ...options], {
+        timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
+      });
+    }
+    return 'completed';
   } catch (error) {
     const code = String(error.stderr || '').match(/npm error code ([A-Z0-9_]+)/)?.[1] || 'UNKNOWN';
-    fail(`npm failed (${code}); reconcile the operation before retrying.`);
+    throw new Error(`npm failed (${code}); reconcile the operation before retrying.`);
   }
 }
 
-export async function execute(
-  request,
-  env,
-  { fetchImpl = fetch, write = npmWrite, maskImpl = mask } = {},
-) {
-  const directory = await mkdtemp(join(env.RUNNER_TEMP || tmpdir(), 'npm-worker-'));
+async function main() {
+  const request = readRequest();
+  const directory = await mkdtemp(join(process.env.RUNNER_TEMP || tmpdir(), 'npm-worker-'));
   try {
-    let tarballPath;
+    let tarball;
     if (request.operation === 'publish') {
-      const authorization = await artifactoryCredential(env, fetchImpl, maskImpl);
-      const tarball = await download(request, env, authorization, fetchImpl);
-      tarballPath = join(directory, 'package.tgz');
-      await writeFile(tarballPath, tarball, { mode: 0o600 });
-      // Read the effective manifest with the same parser used by the pinned CLI.
-      const manifest = await pacote.manifest(tarballPath, {
-        cache: join(directory, 'manifest-cache'),
-        offline: true,
-        ignoreScripts: true,
-        fullReadJson: true,
-        fullMetadata: true,
-      });
-      validateManifest(manifest, request);
+      tarball = await downloadPackage(request, directory);
     }
-    await write(request, tarballPath, env, directory);
-    return { status: 'completed' };
+    const status = await writeToNpm(request, tarball);
+    const receipt = {
+      stage: request.stage, operation_id: request.operationId, operation: request.operation,
+      package: request.name, version: request.version || undefined, dist_tag: request.tag ?? null, status,
+    };
+    console.log(JSON.stringify(receipt));
+    if (process.env.GITHUB_STEP_SUMMARY)
+      await appendFile(process.env.GITHUB_STEP_SUMMARY, `### npm operation\n\n\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\`\n`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
 }
 
-async function main() {
-  const request = readRequest(process.env);
-  const result = await execute(request, process.env);
-  const receipt = {
-    stage: request.stage,
-    operation_id: request.operationId,
-    operation: request.operation,
-    package: request.fullName,
-    version: request.version,
-    dist_tag: request.tag,
-    ...result,
-  };
-  console.log(JSON.stringify(receipt));
-  if (process.env.GITHUB_STEP_SUMMARY)
-    await appendFile(
-      process.env.GITHUB_STEP_SUMMARY,
-      `### npm operation\n\n\`\`\`json\n${JSON.stringify(receipt, null, 2)}\n\`\`\`\n`,
-    );
-}
-
-export function publicErrorMessage(error) {
-  return error instanceof PublisherError
-    ? error.message
-    : 'Publisher failed; inspect the operation before retrying.';
-}
-
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch((error) => {
-    console.error(publicErrorMessage(error));
-    process.exitCode = 1;
-  });
-}
+main().catch(error => {
+  console.error(error.message);
+  process.exitCode = 1;
+});
