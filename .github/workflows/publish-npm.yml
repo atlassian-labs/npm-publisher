@@ -1,0 +1,87 @@
+name: Artifactory npm publisher
+run-name: npm:${{ inputs.operation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Registry operation
+        required: true
+        type: choice
+        default: publish
+        options: [publish, dist-tag-add, dist-tag-remove]
+      package_name:
+        description: npm package name, including scope if applicable (e.g. @scope/package or package)
+        required: true
+        type: string
+      version:
+        description: Exact version for publish/add; optional expected version for tag removal
+        required: false
+        default: ''
+        type: string
+      dist_tag:
+        description: Tag operations only; blank uses latest (prod) or oidc-test (staging). Publish selects its tag from Artifactory.
+        required: false
+        default: ''
+        type: string
+      operation_id:
+        description: Opaque public correlation ID from the caller
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Restrict prod to protected main, and staging to protected staging.
+    # Set the same environment name in each npm trusted-publisher configuration.
+    environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ARTIFACTORY_BASE_URL: ${{ vars.ARTIFACTORY_BASE_URL }}
+    steps:
+      - name: Check out publisher implementation
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up supported Node.js LTS
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: Install repository dependencies and pinned npm
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Authenticate with Artifactory
+        if: inputs.operation == 'publish'
+        id: jfrog
+        uses: jfrog/setup-jfrog-cli@ae385c7164244e984cd20a58674e5b57f53596d7 # v5.3.4
+        env:
+          JF_URL: ${{ env.ARTIFACTORY_BASE_URL }}
+        with:
+          oidc-provider-name: github
+          oidc-audience: ${{ secrets.ARTIFACTORY_OIDC_AUDIENCE || 'packages.atlassian.com' }}
+          disable-job-summary: true
+          disable-auto-build-publish: true
+          disable-auto-evidence-collection: true
+
+      - name: Download and publish package or update npm dist-tag
+        env:
+          PUBLISHER_STAGE: ${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
+          ARTIFACTORY_ACCESS_TOKEN: ${{ steps.jfrog.outputs.oidc-token }}
+          OPERATION: ${{ inputs.operation }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          PACKAGE_VERSION: ${{ inputs.version }}
+          DIST_TAG: ${{ inputs.dist_tag || (github.ref == 'refs/heads/main' && 'latest' || 'oidc-test') }}
+          OPERATION_ID: ${{ inputs.operation_id }}
+        run: node .github/scripts/publisher.js
