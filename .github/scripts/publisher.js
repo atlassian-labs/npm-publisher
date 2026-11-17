@@ -2,11 +2,12 @@ import { execFile } from 'node:child_process';
 import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const registry = 'https://registry.npmjs.org/';
-const temporaryTag = 'npm-publisher-temp';
+const temporaryTag = `npm-publisher-${Date.now()}`;
 
 function readRequest() {
   const { PUBLISHER_STAGE: stage, OPERATION: operation } = process.env;
@@ -64,22 +65,29 @@ async function downloadPackage({ name, version }, directory) {
   return tarball;
 }
 
+async function fetchJson(url, label, { headers, allowNotFound = false } = {}) {
+  const response = await fetch(url, {
+    headers,
+    redirect: 'error',
+    signal: AbortSignal.timeout(10_000),
+  }).catch(() => { throw new Error(`${label} failed; response details suppressed.`); });
+  if (response.status !== 200) {
+    await response.body?.cancel().catch(() => {});
+    if (allowNotFound && response.status === 404) return undefined;
+    throw new Error(`${label} failed (HTTP ${response.status}); response suppressed.`);
+  }
+  return response.json().catch(() => { throw new Error(`Invalid ${label} response.`); });
+}
+
 // Artifactory publish events do not include tags, so fetch them from Artifactory.
 // Tags may move while the event is queued; select one currently pointing to this version.
 // No matching tag tells the caller to publish with a temporary tag and remove it.
 async function selectPublishTag({ name, version }) {
   const base = (process.env.ARTIFACTORY_BASE_URL || '').replace(/\/$/, '');
   // Read the local source repository, not tags merged by a virtual repository.
-  const response = await fetch(`${base}/artifactory/api/npm/npm-public-local/${encodeURIComponent(name)}`, {
+  const metadata = await fetchJson(`${base}/artifactory/api/npm/npm-public-local/${encodeURIComponent(name)}`, 'Artifactory tag lookup', {
     headers: { Authorization: `Bearer ${process.env.ARTIFACTORY_ACCESS_TOKEN}`, 'Cache-Control': 'no-cache' },
-    redirect: 'error',
-    signal: AbortSignal.timeout(10_000),
-  }).catch(() => { throw new Error('Artifactory tag lookup failed; response details suppressed.'); });
-  if (response.status !== 200) {
-    await response.body?.cancel().catch(() => {});
-    throw new Error(`Artifactory tag lookup failed (HTTP ${response.status}); response suppressed.`);
-  }
-  const metadata = await response.json().catch(() => { throw new Error('Invalid Artifactory tag response.'); });
+  });
   const tags = metadata?.['dist-tags'];
   if (!tags || typeof tags !== 'object' || Array.isArray(tags) ||
       Object.values(tags).some(value => typeof value !== 'string' || !value))
@@ -90,25 +98,35 @@ async function selectPublishTag({ name, version }) {
 }
 
 async function tagStillTargetsVersion({ name, version, tag }) {
-  const response = await fetch(`${registry}-/package/${encodeURIComponent(name)}/dist-tags`, {
-    redirect: 'error',
-    signal: AbortSignal.timeout(10_000),
-  }).catch(() => { throw new Error('npm tag lookup failed; response details suppressed.'); });
-  if (response.status === 404) {
-    await response.body?.cancel().catch(() => {});
-    return false;
-  }
-  if (response.status !== 200) {
-    await response.body?.cancel().catch(() => {});
-    throw new Error(`npm tag lookup failed (HTTP ${response.status}); response suppressed.`);
-  }
-  const tags = await response.json().catch(() => { throw new Error('Invalid npm tag lookup response.'); });
+  const tags = await fetchJson(`${registry}-/package/${encodeURIComponent(name)}/dist-tags`, 'npm tag lookup', {
+    allowNotFound: true,
+  });
+  if (tags === undefined) return false;
   if (!tags || typeof tags !== 'object' || Array.isArray(tags))
     throw new Error('Invalid npm tag lookup response.');
   const current = Object.hasOwn(tags, tag) ? tags[tag] : undefined;
   if (current !== undefined && (typeof current !== 'string' || !current))
     throw new Error('Invalid npm tag lookup response.');
   return current === version;
+}
+
+async function runNpm(args) {
+  console.log('npm', ...args);
+  await run('npm', args, { timeout: 300_000, maxBuffer: 2 * 1024 * 1024 });
+}
+
+// Cleanup is best effort: a published version must not be retried if tag removal fails.
+async function removeTemporaryTag(name, options) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await runNpm(['dist-tag', 'rm', name, temporaryTag, ...options]);
+      return;
+    } catch (error) {
+      console.error(`Temporary tag removal failed (attempt ${attempt}/3): ${error.stderr?.trim() || error.message}`);
+      if (attempt < 3) await delay(2000);
+    }
+  }
+  console.warn(`Temporary tag removal failed after 3 attempts; leaving tag ${temporaryTag} on ${name}.`);
 }
 
 async function writeToNpm(request, tarball) {
@@ -126,15 +144,10 @@ async function writeToNpm(request, tarball) {
   if (name.startsWith('@')) options.push(`--${name.split('/')[0]}:registry=${registry}`);
   if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag }))
     return 'skipped';
-  const runNpm = async args => {
-    console.log('npm', ...args);
-    await run('npm', args, { timeout: 300_000, maxBuffer: 2 * 1024 * 1024 });
-  };
   try {
     await runNpm([...commands[operation], ...options]);
-    if (publishWithoutTag) {
-      await runNpm(['dist-tag', 'rm', name, temporaryTag, ...options]);
-    }
+    if (operation === 'publish') console.log(`Package ${name}@${version} published successfully.`);
+    if (publishWithoutTag) await removeTemporaryTag(name, options);
     return 'completed';
   } catch (error) {
     throw new Error(error.stderr?.trim() || error.message);

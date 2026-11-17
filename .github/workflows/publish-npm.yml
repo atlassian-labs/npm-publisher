@@ -46,27 +46,26 @@ jobs:
       ARTIFACTORY_BASE_URL: ${{ vars.ARTIFACTORY_BASE_URL }}
     steps:
       - name: Check out publisher implementation
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           fetch-depth: 1
 
       - name: Set up supported Node.js LTS
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26'
           package-manager-cache: false
 
-      - name: Upgrade npm for OIDC dist-tags
-        run: npm install --global npm@latest --registry=https://registry.npmjs.org/
-
-      - name: Install repository dependencies
-        run: npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+      - name: Install repository dependencies and pinned npm
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
+          echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
 
       - name: Authenticate with Artifactory
         if: inputs.operation == 'publish'
         id: jfrog
-        uses: jfrog/setup-jfrog-cli@v5.3.4
+        uses: jfrog/setup-jfrog-cli@ae385c7164244e984cd20a58674e5b57f53596d7 # v5.3.4
         env:
           JF_URL: ${{ env.ARTIFACTORY_BASE_URL }}
         with:
