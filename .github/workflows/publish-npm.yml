@@ -1,9 +1,18 @@
 name: Artifactory npm publisher
-run-name: npm:${{ inputs.operation_id }}
+run-name: ${{ inputs.validate_oidc && 'Validate npm OIDC' || format('npm:{0}', inputs.operation_id) }}
 
 on:
   workflow_dispatch:
     inputs:
+      validate_oidc:
+        description: Check dist-tag write access for validation_packages; skip the normal publishing flow
+        required: false
+        default: false
+        type: boolean
+      validation_packages:
+        description: Validation only; comma- or whitespace-separated names. Blank uses .github/scripts/oidc-packages.txt
+        required: false
+        type: string
       operation:
         description: Registry operation
         required: true
@@ -35,7 +44,7 @@ jobs:
   publish:
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.validate_oidc && 360 || 15 }}
     # Restrict prod to protected main, and staging to protected staging.
     # Set the same environment name in each npm trusted-publisher configuration.
     environment: ${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
@@ -61,9 +70,14 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org/
           echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Validate OIDC dist-tag access
+        if: inputs.validate_oidc
+        env:
+          PACKAGES: ${{ inputs.validation_packages }}
+        run: node .github/scripts/validate-oidc.js
 
       - name: Authenticate with Artifactory
-        if: inputs.operation == 'publish'
+        if: ${{ !inputs.validate_oidc && inputs.operation == 'publish' }}
         id: jfrog
         uses: jfrog/setup-jfrog-cli@ae385c7164244e984cd20a58674e5b57f53596d7 # v5.3.4
         env:
@@ -76,6 +90,7 @@ jobs:
           disable-auto-evidence-collection: true
 
       - name: Download and publish package or update npm dist-tag
+        if: ${{ !inputs.validate_oidc }}
         env:
           PUBLISHER_STAGE: ${{ github.ref == 'refs/heads/main' && 'prod' || 'staging' }}
           ARTIFACTORY_ACCESS_TOKEN: ${{ steps.jfrog.outputs.oidc-token }}
