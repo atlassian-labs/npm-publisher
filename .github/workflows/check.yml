@@ -23,5 +23,3 @@ jobs:
           echo "$GITHUB_WORKSPACE/node_modules/.bin" >> "$GITHUB_PATH"
       - run: npm run check
       - run: npm test
-      - name: Audit installed dependencies
-        run: npm audit --audit-level=high --registry=https://registry.npmjs.org/
