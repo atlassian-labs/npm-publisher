@@ -145,7 +145,7 @@ async function writeToNpm(request, tarball) {
   const publishWithoutTag = operation === 'publish' && !tag;
   if (publishWithoutTag) console.log(`No Artifactory tag points to this version; publishing with temporary tag ${temporaryTag}, then removing it.`);
   const commands = {
-    publish: ['publish', tarball, `--tag=${tag || temporaryTag}`, '--access=public', '--provenance'],
+    publish: ['publish', tarball, `--tag=${tag || temporaryTag}`, '--access=public', '--provenance=false'],
     'dist-tag-add': ['dist-tag', 'add', `${name}@${version}`, tag],
     'dist-tag-remove': ['dist-tag', 'rm', name, tag],
   };
