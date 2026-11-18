@@ -34,6 +34,7 @@ async function downloadPackage({ name, version }, directory) {
 
   const packagePath = name.replaceAll('@', '%40');
   const url = `${base.replace(/\/$/, '')}/artifactory/api/npm/npm-public/${packagePath}/-/${packagePath}-${encodeURIComponent(version)}.tgz`;
+  console.log(`Downloading ${name}@${version} from Artifactory...`);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     redirect: 'error',
@@ -62,6 +63,7 @@ async function downloadPackage({ name, version }, directory) {
   if (size > limit) throw new Error('Artifact exceeds the 100 MiB size limit.');
   const tarball = join(directory, 'package.tgz');
   await writeFile(tarball, Buffer.concat(chunks), { mode: 0o600 });
+  console.log(`Successfully downloaded ${name}@${version} from Artifactory (${size} bytes).`);
   return tarball;
 }
 
@@ -84,6 +86,7 @@ async function fetchJson(url, label, { headers, allowNotFound = false } = {}) {
 // No matching tag tells the caller to publish with a temporary tag and remove it.
 async function selectPublishTag({ name, version }) {
   const base = (process.env.ARTIFACTORY_BASE_URL || '').replace(/\/$/, '');
+  console.log(`Looking up Artifactory tags for ${name}@${version}...`);
   // Read metadata from the same repository endpoint used for tarball downloads.
   const metadata = await fetchJson(`${base}/artifactory/api/npm/npm-public/${encodeURIComponent(name)}`, 'Artifactory tag lookup', {
     headers: { Authorization: `Bearer ${process.env.ARTIFACTORY_ACCESS_TOKEN}`, 'Cache-Control': 'no-cache' },
@@ -94,10 +97,13 @@ async function selectPublishTag({ name, version }) {
     throw new Error('Invalid Artifactory tag response.');
   const attached = Object.keys(tags).filter(tag => tags[tag] === version);
   if (!attached.length) return undefined;
-  return attached.find(tag => tag !== 'latest') || 'latest';
+  const selectedTag = attached.find(tag => tag !== 'latest') || 'latest';
+  console.log(`Selected Artifactory tag ${selectedTag} for ${name}@${version}.`);
+  return selectedTag;
 }
 
 async function tagStillTargetsVersion({ name, version, tag }) {
+  console.log(`Checking whether npm tag ${tag} points to ${name}@${version}...`);
   const tags = await fetchJson(`${registry}-/package/${encodeURIComponent(name)}/dist-tags`, 'npm tag lookup', {
     allowNotFound: true,
   });
@@ -112,7 +118,9 @@ async function tagStillTargetsVersion({ name, version, tag }) {
 
 async function runNpm(args) {
   console.log('npm', ...args);
-  await run('npm', args, { timeout: 300_000, maxBuffer: 2 * 1024 * 1024 });
+  const { stdout, stderr } = await run('npm', args, { timeout: 300_000, maxBuffer: 2 * 1024 * 1024 });
+  if (stdout) process.stdout.write(stdout);
+  if (stderr) process.stderr.write(stderr);
 }
 
 // Cleanup is best effort: a published version must not be retried if tag removal fails.
@@ -120,6 +128,7 @@ async function removeTemporaryTag(name, options) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       await runNpm(['dist-tag', 'rm', name, temporaryTag, ...options]);
+      console.log(`Successfully removed temporary tag ${temporaryTag} from ${name}.`);
       return;
     } catch (error) {
       console.error(`Temporary tag removal failed (attempt ${attempt}/3): ${error.stderr?.trim() || error.message}`);
@@ -142,11 +151,15 @@ async function writeToNpm(request, tarball) {
   };
   const options = [`--registry=${registry}`, '--ignore-scripts', '--workspaces=false', '--loglevel=error'];
   if (name.startsWith('@')) options.push(`--${name.split('/')[0]}:registry=${registry}`);
-  if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag }))
+  if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag })) {
+    console.log(`Skipping removal of npm tag ${tag} from ${name}: it does not point to ${version}.`);
     return 'skipped';
+  }
   try {
     await runNpm([...commands[operation], ...options]);
     if (operation === 'publish') console.log(`Package ${name}@${version} published successfully.`);
+    if (operation === 'dist-tag-add') console.log(`Successfully set npm tag ${tag} to ${name}@${version}.`);
+    if (operation === 'dist-tag-remove') console.log(`Successfully removed npm tag ${tag} from ${name}.`);
     if (publishWithoutTag) await removeTemporaryTag(name, options);
     return 'completed';
   } catch (error) {
@@ -156,6 +169,7 @@ async function writeToNpm(request, tarball) {
 
 async function main() {
   const request = readRequest();
+  console.log(`Starting ${request.operation} for ${request.name} (stage: ${request.stage}, operation ID: ${request.operationId}).`);
   const directory = await mkdtemp(join(process.env.RUNNER_TEMP || tmpdir(), 'npm-worker-'));
   try {
     let tarball;
