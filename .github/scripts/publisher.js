@@ -84,8 +84,8 @@ async function fetchJson(url, label, { headers, allowNotFound = false } = {}) {
 // No matching tag tells the caller to publish with a temporary tag and remove it.
 async function selectPublishTag({ name, version }) {
   const base = (process.env.ARTIFACTORY_BASE_URL || '').replace(/\/$/, '');
-  // Read the local source repository, not tags merged by a virtual repository.
-  const metadata = await fetchJson(`${base}/artifactory/api/npm/npm-public-local/${encodeURIComponent(name)}`, 'Artifactory tag lookup', {
+  // Read metadata from the same repository endpoint used for tarball downloads.
+  const metadata = await fetchJson(`${base}/artifactory/api/npm/npm-public/${encodeURIComponent(name)}`, 'Artifactory tag lookup', {
     headers: { Authorization: `Bearer ${process.env.ARTIFACTORY_ACCESS_TOKEN}`, 'Cache-Control': 'no-cache' },
   });
   const tags = metadata?.['dist-tags'];
