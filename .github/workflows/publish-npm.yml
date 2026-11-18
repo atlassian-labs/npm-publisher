@@ -20,8 +20,8 @@ on:
         default: publish
         options: [publish, dist-tag-add, dist-tag-remove]
       package_name:
-        description: Required for normal operations; npm package name including scope (e.g. @scope/package)
-        required: false
+        description: npm package name, including scope if applicable (e.g. @scope/package or package)
+        required: true
         type: string
       version:
         description: Exact version for publish/add; optional expected version for tag removal
@@ -34,8 +34,8 @@ on:
         default: ''
         type: string
       operation_id:
-        description: Required for normal operations; opaque public correlation ID from the caller
-        required: false
+        description: Opaque public correlation ID from the caller
+        required: true
         type: string
 
 permissions: {}
