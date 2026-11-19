@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 
 const run = promisify(execFile);
 const registry = 'https://registry.npmjs.org/';
-const temporaryTag = `npm-publisher-${Date.now()}`;
+const temporaryTag = 'npm-publisher';
 
 function readRequest() {
   const { PUBLISHER_STAGE: stage, OPERATION: operation } = process.env;
