@@ -1,5 +1,5 @@
 name: Artifactory npm publisher
-run-name: ${{ inputs.validate_oidc && 'Validate npm OIDC' || format('{0} | {1} | npm:{2}', inputs.operation, inputs.version && format('{0}@{1}', inputs.package_name, inputs.version) || inputs.package_name, inputs.operation_id) }}
+run-name: ${{ inputs.validate_oidc && 'Validate npm OIDC' || format('{0} | {1} | {2}', inputs.operation, inputs.version && format('{0}@{1}', inputs.package_name, inputs.version) || inputs.package_name, inputs.operation_id) }}
 
 on:
   workflow_dispatch:
