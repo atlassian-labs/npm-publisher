@@ -38,20 +38,12 @@ async function downloadPackage({ name, version }, directory) {
   console.log(`Artifactory download URL: ${url}`);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
-    redirect: 'manual',
     signal: AbortSignal.timeout(180_000),
   }).catch(error => {
     const details = [error.message, error.cause?.message].filter(Boolean).join(': ');
     throw new Error(`Artifact download request failed: ${details}`, { cause: error });
   });
   if (!response.ok) {
-    if (response.status === 302) {
-      const location = response.headers.get('location');
-      const target = location ? new URL(location, url) : undefined;
-      console.log(`Artifactory download redirect URL: ${target ? `${target.origin}${target.pathname}${target.search ? '?[query redacted]' : ''}` : '(missing Location header)'}`);
-      await response.body?.cancel().catch(() => {});
-      throw new Error(`Artifact download failed (HTTP ${response.status} ${response.statusText}).`);
-    }
     const details = await response.text().catch(error => `Unable to read error response: ${error.message}`);
     throw new Error(`Artifact download failed (HTTP ${response.status} ${response.statusText}): ${details}`);
   }

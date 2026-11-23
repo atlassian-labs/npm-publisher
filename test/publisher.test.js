@@ -9,8 +9,8 @@ const script = resolve('.github/scripts/publisher.js');
 const parseReceipt = stdout => JSON.parse(stdout.trim().split('\n').at(-1));
 
 // Run the production helper, replacing only network and npm process effects.
-async function removeTag({ version = '1.2.3', body = '{"beta":"1.2.3"}', status = 200,
-  fetchError = false } = {}) {
+async function runPublisher({ operation = 'dist-tag-remove', version = '1.2.3',
+  body = '{"beta":"1.2.3"}', status = 200, fetchError = false, download = {} } = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'publisher-js-test-'));
   const temp = join(directory, 'temp');
   const effects = join(directory, 'effects.jsonl');
@@ -21,24 +21,36 @@ async function removeTag({ version = '1.2.3', body = '{"beta":"1.2.3"}', status 
     await writeFile(preload, `
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
+const fixture = ${JSON.stringify({ operation, body, status, fetchError, download })};
 const record = effect => appendFileSync(${JSON.stringify(effects)}, JSON.stringify(effect) + '\\n');
 globalThis.fetch = async (url, options) => {
-  record({ type: 'read', url, redirect: options.redirect, hasSignal: !!options.signal,
+  record({ type: 'read', url, redirect: new Request(url, options).redirect, hasSignal: !!options.signal,
     headers: options.headers });
-  if (${fetchError}) throw new Error('private transport details');
-  return new Response(${JSON.stringify(body)}, { status: ${status} });
+  if (fixture.operation === 'publish' && url.endsWith('.tgz')) {
+    const { fetchError, readError, body = 'test tarball', status = 200, statusText = '' } = fixture.download;
+    if (fetchError) throw new TypeError(fetchError.message,
+      fetchError.cause ? { cause: new Error(fetchError.cause) } : undefined);
+    const stream = readError ? new ReadableStream({
+      start(controller) { controller.error(new Error(readError)); },
+    }) : body;
+    return new Response(stream, { status, statusText });
+  }
+  if (fixture.fetchError) throw new Error('private transport details');
+  return new Response(fixture.body, { status: fixture.status });
 };
 childProcess.execFile = (command, args, options, callback) => {
-  record({ type: 'write', command, args });
+  record({ type: 'write', command, args,
+    tarball: args[0] === 'publish' ? readFileSync(args[1], 'utf8') : undefined });
   queueMicrotask(() => callback(null, '', ''));
   return {};
 };
 syncBuiltinESMExports();
 `);
     const result = spawnSync(process.execPath, ['--import', preload, script], {
-      env: { ...process.env, PUBLISHER_STAGE: 'prod', OPERATION: 'dist-tag-remove',
+      env: { ...process.env, PUBLISHER_STAGE: 'prod', OPERATION: operation,
         PACKAGE_NAME: '@example/widget', PACKAGE_VERSION: version, DIST_TAG: 'beta',
+        ARTIFACTORY_BASE_URL: 'https://artifactory.example.test', ARTIFACTORY_ACCESS_TOKEN: 'test-artifactory-token',
         OPERATION_ID: 'event-123', RUNNER_TEMP: temp, GITHUB_STEP_SUMMARY: summary },
       encoding: 'utf8', timeout: 20_000,
     });
@@ -54,7 +66,7 @@ syncBuiltinESMExports();
 }
 
 test('versioned tag removal checks the current target immediately before writing', async () => {
-  const result = await removeTag();
+  const result = await runPublisher();
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.effects.map(effect => effect.type), ['read', 'write']);
   assert.deepEqual(result.effects[0], { type: 'read',
@@ -69,7 +81,7 @@ test('versioned tag removal checks the current target immediately before writing
 
 test('moved or absent tags skip removal and report a truthful successful receipt', async () => {
   for (const fixture of [{ body: '{"beta":"2.0.0"}' }, { body: '{}' }, { status: 404 }]) {
-    const result = await removeTag(fixture);
+    const result = await runPublisher(fixture);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
     assert.equal(parseReceipt(result.stdout).status, 'skipped');
@@ -87,7 +99,7 @@ test('failed or malformed tag lookups fail closed without exposing responses', a
     ...['private registry response', 'null', '[]', '{"beta":42}', '{"beta":null}', '{"beta":""}']
       .map(body => ({ body })),
   ]) {
-    const result = await removeTag(fixture);
+    const result = await runPublisher(fixture);
     assert.notEqual(result.status, 0);
     assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
     assert(!`${result.stdout}${result.stderr}`.includes('private registry response'));
@@ -98,10 +110,69 @@ test('failed or malformed tag lookups fail closed without exposing responses', a
 });
 
 test('unversioned manual removal keeps direct removal without a registry precheck', async () => {
-  const result = await removeTag({ version: '' });
+  const result = await runPublisher({ version: '' });
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.effects.map(effect => effect.type), ['write']);
   assert.equal(parseReceipt(result.stdout).status, 'completed');
   assert(!Object.hasOwn(parseReceipt(result.stdout), 'version'));
+  assert.deepEqual(result.remaining, []);
+});
+
+test('package downloads follow redirects by default and publish the downloaded content', async () => {
+  const result = await runPublisher({ operation: 'publish', body: '{"dist-tags":{"beta":"1.2.3"}}',
+    download: { body: 'downloaded tarball' } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.effects.map(effect => effect.type), ['read', 'read', 'write']);
+  const [download, metadata, publish] = result.effects;
+  assert.equal(download.url, 'https://artifactory.example.test/artifactory/api/npm/npm-public/%40example/widget/-/%40example/widget-1.2.3.tgz');
+  assert.equal(download.redirect, 'follow');
+  assert.equal(download.hasSignal, true);
+  assert.equal(download.headers.Authorization, 'Bearer test-artifactory-token');
+  assert.equal(metadata.redirect, 'error');
+  assert.equal(publish.command, 'npm');
+  assert.equal(publish.args[0], 'publish');
+  assert.equal(publish.tarball, 'downloaded tarball');
+  assert.match(result.stdout, /Successfully downloaded @example\/widget@1\.2\.3/);
+  assert.equal(parseReceipt(result.stdout).status, 'completed');
+  assert.deepEqual(result.remaining, []);
+});
+
+test('failed downloads report HTTP status and response body without publishing', async () => {
+  for (const download of [
+    { status: 403, statusText: 'Forbidden', body: 'Permission denied for this package' },
+    { status: 404, statusText: 'Not Found', body: '{"error":"Package version not found"}' },
+    { status: 500, statusText: 'Internal Server Error', body: 'Storage unavailable' },
+  ]) {
+    const result = await runPublisher({ operation: 'publish', download });
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(`HTTP ${download.status} ${download.statusText}`));
+    assert.ok(result.stderr.includes(download.body));
+    assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+    assert.equal(result.summary, '');
+    assert.deepEqual(result.remaining, []);
+  }
+});
+
+test('download request failures report the original message and underlying cause', async () => {
+  for (const fetchError of [
+    { message: 'fetch failed', cause: 'getaddrinfo ENOTFOUND artifactory.example.test' },
+    { message: 'The operation was aborted due to timeout' },
+  ]) {
+    const result = await runPublisher({ operation: 'publish', download: { fetchError } });
+    assert.notEqual(result.status, 0);
+    assert.ok(result.stderr.includes(`Artifact download request failed: ${fetchError.message}`));
+    if (fetchError.cause) assert.ok(result.stderr.includes(fetchError.cause));
+    assert.ok(!result.stderr.includes('undefined'));
+    assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+    assert.deepEqual(result.remaining, []);
+  }
+});
+
+test('download stream failures preserve the error and stop publishing', async () => {
+  const result = await runPublisher({ operation: 'publish', download: { readError: 'Download connection reset' } });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Download connection reset/);
+  assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+  assert.equal(result.summary, '');
   assert.deepEqual(result.remaining, []);
 });
