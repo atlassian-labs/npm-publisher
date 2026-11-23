@@ -35,14 +35,18 @@ async function downloadPackage({ name, version }, directory) {
   const packagePath = name.replaceAll('@', '%40');
   const url = `${base.replace(/\/$/, '')}/artifactory/api/npm/npm-public/${packagePath}/-/${packagePath}-${encodeURIComponent(version)}.tgz`;
   console.log(`Downloading ${name}@${version} from Artifactory...`);
+  console.log(`Artifactory download URL: ${url}`);
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     redirect: 'error',
     signal: AbortSignal.timeout(180_000),
-  }).catch(() => { throw new Error('Artifact download request failed; response details suppressed.'); });
+  }).catch(error => {
+    const details = [error.message, error.cause?.message].filter(Boolean).join(': ');
+    throw new Error(`Artifact download request failed: ${details}`, { cause: error });
+  });
   if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
-    throw new Error(`Artifact download failed (HTTP ${response.status}); response suppressed.`);
+    const details = await response.text().catch(error => `Unable to read error response: ${error.message}`);
+    throw new Error(`Artifact download failed (HTTP ${response.status} ${response.statusText}): ${details}`);
   }
   const limit = 100 * 1024 * 1024;
   if (Number(response.headers.get('content-length')) > limit) {
@@ -57,8 +61,8 @@ async function downloadPackage({ name, version }, directory) {
       if (size > limit) break;
       chunks.push(chunk);
     }
-  } catch {
-    throw new Error('Unable to read the artifact download; response details suppressed.');
+  } catch (error) {
+    throw error;
   }
   if (size > limit) throw new Error('Artifact exceeds the 100 MiB size limit.');
   const tarball = join(directory, 'package.tgz');
