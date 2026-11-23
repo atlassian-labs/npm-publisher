@@ -19,6 +19,13 @@
 //   node scripts/onboard-package.js @scope/one @scope/two --dry-run
 //   node scripts/onboard-package.js @scope/pkg --access restricted
 //   node scripts/onboard-package.js @scope/pkg --version 0.0.1
+//   node scripts/onboard-package.js --trust-only --limit 3
+//   node scripts/onboard-package.js --trust-only @scope/existing-package
+//
+// With no package arguments, read .github/scripts/oidc-packages.txt and record
+// completed packages so bulk runs resume. --trust-only skips placeholder
+// publishing. --otp-command (or NPM_OTP_COMMAND) can supply codes from a password
+// manager instead of browser authentication; its output is never printed.
 //
 // `npm trust github` cannot grant dist-tag: its permission list holds only
 // createPackage and createStagedPackage (node_modules/npm/lib/trust-cmd.js), so
@@ -27,7 +34,8 @@
 // no update and POST conflicts with an existing entry; the original is put back
 // if the replacement fails, so a package is never left untrusted.
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -49,7 +57,10 @@ const TRUST = {
 // manageDistTags -> "npm dist-tag". createPackage also lets the workflow publish
 // a name that does not exist yet, which is what onboarding needs.
 const PERMISSIONS = ['createPackage', 'createStagedPackage', 'manageDistTags'];
-const DIST_TAGS = 'manageDistTags';
+const PACKAGES_FILE = new URL('../.github/scripts/oidc-packages.txt', import.meta.url);
+// Keep the old trust script's progress file so existing bulk runs can resume.
+const PROGRESS_FILE = new URL('./add-oidc-trust-progress.json', import.meta.url);
+const execFileAsync = promisify(execFile);
 
 const VALID_NAME = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 const PAUSE_MS = 2000;
@@ -57,6 +68,10 @@ const PAUSE_MS = 2000;
 let dryRun = false;
 let access = 'public';
 let firstVersion = '0.0.0';
+let trustOnly = false;
+let limit = Infinity;
+let otpCommand = process.env.NPM_OTP_COMMAND;
+let oneTimePassword = null;
 const packages = [];
 
 // Parsed from main so a bad flag reports as a message, not a stack trace.
@@ -67,6 +82,16 @@ function parseArguments() {
     if (argument === '--dry-run') dryRun = true;
     else if (argument === '--access') access = argv[++index];
     else if (argument === '--version') firstVersion = argv[++index];
+    else if (argument === '--trust-only') trustOnly = true;
+    else if (argument === '--limit') {
+      limit = Number(argv[++index]);
+      if (!Number.isSafeInteger(limit) || limit < 1)
+        throw new Error('--limit must be a positive integer.');
+    }
+    else if (argument === '--otp-command') {
+      otpCommand = argv[++index];
+      if (!otpCommand) throw new Error('--otp-command needs a command.');
+    }
     else if (argument.startsWith('-')) throw new Error(`Unknown argument: ${argument}`);
     else packages.push(argument);
   }
@@ -115,6 +140,7 @@ async function ensureLoggedIn() {
 // `npm config get` refuses to return auth tokens, so the npmrc files are read
 // directly. The value is never logged.
 async function readToken() {
+  if (process.env.NPM_TOKEN) return process.env.NPM_TOKEN;
   for (const candidate of [new URL('../.npmrc', import.meta.url), join(homedir(), '.npmrc')]) {
     let contents;
     try {
@@ -127,6 +153,39 @@ async function readToken() {
     if (value && !value.startsWith('${')) return value;
   }
   throw new Error('Signed in, but no npmjs.org token found in .npmrc.');
+}
+
+async function loadPackages() {
+  const contents = await readFile(PACKAGES_FILE, 'utf8');
+  const names = [...new Set(contents.split(/[\s,]+/).filter(Boolean))];
+  if (!names.length) throw new Error(`No packages listed in ${PACKAGES_FILE.pathname}`);
+  return names;
+}
+
+async function loadProgress() {
+  try {
+    const stored = JSON.parse(await readFile(PROGRESS_FILE, 'utf8'));
+    return Array.isArray(stored.done) ? stored.done : [];
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+}
+
+async function requestOneTimePassword() {
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync('/bin/sh', ['-c', otpCommand], {
+      timeout: 60_000,
+      maxBuffer: 64 * 1024,
+    }));
+  } catch {
+    throw new Error('--otp-command failed (output not shown).');
+  }
+  const code = stdout.trim().split(/\s+/).pop() ?? '';
+  if (!/^[0-9]{6,8}$/.test(code))
+    throw new Error('--otp-command did not return a 6-8 digit code (output not shown).');
+  return code;
 }
 
 // Unauthenticated: 404 means the name has never been published.
@@ -214,7 +273,7 @@ async function authenticateInBrowser({ authUrl, doneUrl }) {
 
 async function registryRequest(method, path, body) {
   // Browser verification belongs to this request, not later trust operations.
-  let oneTimePassword = null;
+  let browserProof = null;
   let authAttempts = 0;
   let throttleAttempts = 0;
 
@@ -224,9 +283,9 @@ async function registryRequest(method, path, body) {
       headers: {
         authorization: `Bearer ${token}`,
         accept: 'application/json',
-        'npm-auth-type': 'web',
+        ...(otpCommand ? {} : { 'npm-auth-type': 'web' }),
         'npm-command': 'trust',
-        ...(oneTimePassword ? { 'npm-otp': oneTimePassword } : {}),
+        ...((browserProof || oneTimePassword) ? { 'npm-otp': browserProof || oneTimePassword } : {}),
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -261,21 +320,27 @@ async function registryRequest(method, path, body) {
       if (authAttempts > 5)
         throw new Error(`${method} ${path} -> ${response.status} after ${authAttempts - 1} attempts`);
 
+      if (otpCommand) {
+        console.log('  npm requires two-factor authentication; getting a code from --otp-command.');
+        oneTimePassword = await requestOneTimePassword();
+        continue;
+      }
+
       let challenge;
       try { challenge = JSON.parse(text); } catch { /* Handled below. */ }
       if (!challenge?.authUrl || !challenge?.doneUrl) {
         // An expired/rejected proof may suppress the next browser challenge.
         // Retry without it so npm can issue a fresh challenge for this request.
-        if (oneTimePassword) {
+        if (browserProof) {
           console.log('  Browser verification was rejected; requesting a fresh authentication challenge.');
-          oneTimePassword = null;
+          browserProof = null;
           continue;
         }
         throw new Error(`${method} ${path} -> ${response.status}: npm did not provide a browser authentication challenge. Check your npm login and package permissions.`);
       }
 
       console.log('  npm requires browser authentication to continue.');
-      oneTimePassword = await authenticateInBrowser(challenge);
+      browserProof = await authenticateInBrowser(challenge);
       console.log('  Browser authentication completed.');
       continue;
     }
@@ -307,11 +372,11 @@ async function configureTrust(name) {
 
   if (existing) {
     const permissions = existing.permissions ?? [];
-    if (permissions.includes(DIST_TAGS))
-      return 'OIDC trust already exists with dist-tag permission.';
+    if (PERMISSIONS.every(permission => permissions.includes(permission)))
+      return 'OIDC trust already exists with publish, stage publish and dist-tag permissions.';
 
-    const wanted = [...new Set([...permissions, DIST_TAGS])];
-    if (dryRun) return 'OIDC trust exists; would add dist-tag permission.';
+    const wanted = [...new Set([...permissions, ...PERMISSIONS])];
+    if (dryRun) return 'OIDC trust exists; would add missing permissions.';
     if (!existing.id) throw new Error(`existing configuration has no id for ${name}`);
 
     const replacement = { type: existing.type, claims: existing.claims };
@@ -344,29 +409,38 @@ async function configureTrust(name) {
 
 async function main() {
   parseArguments();
-  if (!packages.length)
-    throw new Error('Name at least one package, e.g. node scripts/onboard-package.js @scope/pkg');
-  const invalid = packages.filter(name => !VALID_NAME.test(name));
+  const explicit = packages.length > 0;
+  const all = explicit ? [...new Set(packages)] : await loadPackages();
+  const invalid = all.filter(name => !VALID_NAME.test(name));
   if (invalid.length) throw new Error(`Invalid package names: ${invalid.join(', ')}`);
+  const done = explicit ? [] : await loadProgress();
+  const settled = new Set(done);
+  const queue = all.filter(name => !settled.has(name)).slice(0, limit);
 
   console.log(
     `${TRUST.claims.repository} / ${TRUST.claims.workflow_ref.file} / ${TRUST.claims.environment}`,
   );
   console.log(`permissions: ${PERMISSIONS.join(', ')}`);
-  console.log(`${packages.length} package(s)${dryRun ? ' (dry run)' : ''}\n`);
+  console.log(`${queue.length} package(s)${trustOnly ? ' (trust only)' : ''}${dryRun ? ' (dry run)' : ''}\n`);
+  if (!explicit) console.log(`Using ${PACKAGES_FILE.pathname}; ${settled.size} already done.\n`);
+  if (!queue.length) return;
 
-  await ensureLoggedIn();
+  if (!trustOnly || !process.env.NPM_TOKEN) await ensureLoggedIn();
   token = await readToken();
 
   const failures = [];
-  for (const [index, name] of packages.entries()) {
+  for (const [index, name] of queue.entries()) {
     if (index) await sleep(PAUSE_MS);
-    console.log(`[${index + 1}/${packages.length}] ${name}`);
+    console.log(`[${index + 1}/${queue.length}] ${name}`);
     try {
-      if (await packageExists(name)) {
+      if (trustOnly) {
+        console.log('  Configuring OIDC trust only; skipping placeholder publishing.');
+      } else if (await packageExists(name)) {
         console.log('  Package already exists on npm.');
       } else if (dryRun) {
         console.log(`  not on npm — would publish ${firstVersion} (${access})`);
+        console.log('  Would create OIDC trust after publishing the placeholder.');
+        continue;
       } else {
         console.log(`  not on npm. Publishing ${firstVersion} as ${access} claims the name.`);
         await publishFirstVersion(name);
@@ -374,6 +448,10 @@ async function main() {
       }
 
       console.log(`  ${await configureTrust(name)}`);
+      if (!dryRun && !explicit) {
+        done.push(name);
+        await writeFile(PROGRESS_FILE, `${JSON.stringify({ done }, null, 2)}\n`);
+      }
     } catch (error) {
       console.log('  FAILED');
       console.error(`  ${error.message}`);

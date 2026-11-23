@@ -4,6 +4,7 @@ node_modules/
 *.log
 .npmrc
 .npmrc-*
+scripts/add-oidc-trust-progress.json
 coverage/
 .env
 .env.*
