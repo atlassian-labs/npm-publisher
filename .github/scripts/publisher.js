@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { appendFile, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { appendFile, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -84,6 +85,29 @@ async function fetchJson(url, label, { headers, allowNotFound = false } = {}) {
   return response.json().catch(() => { throw new Error(`Invalid ${label} response.`); });
 }
 
+async function alreadyPublished({ name, version }, tarball) {
+  console.log(`Checking whether ${name}@${version} is already published on npm...`);
+  const metadata = await fetchJson(`${registry}${encodeURIComponent(name)}/${encodeURIComponent(version)}`, 'npm version lookup', {
+    headers: { 'Cache-Control': 'no-cache' },
+    allowNotFound: true,
+  });
+  if (metadata === undefined) return false;
+  if (metadata?.name !== name || metadata?.version !== version)
+    throw new Error('Invalid npm version lookup response.');
+
+  const { integrity, shasum } = metadata.dist || {};
+  const content = await readFile(tarball);
+  // Prefer npm's SHA-512 integrity; older releases may only have a SHA-1 shasum.
+  const matches = integrity
+    ? typeof integrity === 'string' && integrity.split(/\s+/).includes(`sha512-${createHash('sha512').update(content).digest('base64')}`)
+    : typeof shasum === 'string' && shasum === createHash('sha1').update(content).digest('hex');
+  if (!matches)
+    throw new Error(`${name}@${version} already exists on npm, but its integrity does not match the Artifactory tarball or cannot be verified.`);
+
+  console.log(`Skipping publish: ${name}@${version} is already published with matching integrity.`);
+  return true;
+}
+
 // Artifactory publish events do not include tags, so fetch them from Artifactory.
 // Tags may move while the event is queued; select one currently pointing to this version.
 // No matching tag tells the caller to publish with a temporary tag and remove it.
@@ -142,7 +166,10 @@ async function removeTemporaryTag(name, options) {
 }
 
 async function writeToNpm(request, tarball) {
-  if (request.operation === 'publish') request.tag = await selectPublishTag(request);
+  if (request.operation === 'publish') {
+    if (await alreadyPublished(request, tarball)) return 'skipped';
+    request.tag = await selectPublishTag(request);
+  }
   const { operation, name, version, tag } = request;
   // npm always publishes with a tag; remove the temporary tag after an untagged publish.
   const publishWithoutTag = operation === 'publish' && !tag;
@@ -166,6 +193,11 @@ async function writeToNpm(request, tarball) {
     if (publishWithoutTag) await removeTemporaryTag(name, options);
     return 'completed';
   } catch (error) {
+    // Another publisher may have completed after the initial version lookup.
+    if (operation === 'publish' && /npm error code E409\b|cannot publish over/i.test(error.stderr || error.message)) {
+      console.log('npm reported a publish conflict; checking the published version again.');
+      if (await alreadyPublished(request, tarball)) return 'skipped';
+    }
     throw new Error(error.stderr?.trim() || error.message);
   }
 }
