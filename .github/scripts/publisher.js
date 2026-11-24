@@ -132,7 +132,9 @@ async function shouldSkipOperation({ operation, name, version, tag }) {
   const skip = operation === 'dist-tag-add'
     ? current === version
     : current === undefined || (!!version && current !== version);
-  if (skip)
+  if (skip && operation === 'dist-tag-remove' && current !== undefined)
+    console.log(`Skipping ${operation} for ${name}: tag ${tag} points to ${current}, expected ${version}.`);
+  else if (skip)
     console.log(`Skipping ${operation} for ${name}: tag ${tag} ${current === undefined ? 'does not exist' : `already points to ${current}`}.`);
   return skip;
 }
