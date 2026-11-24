@@ -77,7 +77,7 @@ test('versioned tag removal checks the current target immediately before writing
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.effects.map(effect => effect.type), ['read', 'write']);
   assert.deepEqual(result.effects[0], { type: 'read',
-    url: 'https://registry.npmjs.org/-/package/%40example%2Fwidget/dist-tags',
+    url: 'https://registry.npmjs.org/-/package/%40example%2Fwidget/dist-tags?write=true',
     redirect: 'error', hasSignal: true });
   assert.equal(result.effects[1].command, 'npm');
   assert.deepEqual(result.effects[1].args.slice(0, 4), ['dist-tag', 'rm', '@example/widget', 'beta']);
@@ -116,13 +116,58 @@ test('failed or malformed tag lookups fail closed without exposing responses', a
   }
 });
 
-test('unversioned manual removal keeps direct removal without a registry precheck', async () => {
+test('unversioned removal checks the tag and removes its current target', async () => {
   const result = await runPublisher({ version: '' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.effects.map(effect => effect.type), ['write']);
+  assert.deepEqual(result.effects.map(effect => effect.type), ['read', 'write']);
+  assert.deepEqual(result.effects[1].args.slice(0, 4), ['dist-tag', 'rm', '@example/widget', 'beta']);
   assert.equal(parseReceipt(result.stdout).status, 'completed');
   assert(!Object.hasOwn(parseReceipt(result.stdout), 'version'));
   assert.deepEqual(result.remaining, []);
+});
+
+test('unversioned removal skips absent tags', async () => {
+  for (const fixture of [{ body: '{}' }, { status: 404 }]) {
+    const result = await runPublisher({ version: '', ...fixture });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+    assert.equal(parseReceipt(result.stdout).status, 'skipped');
+    assert.match(result.stdout, /tag beta does not exist/);
+    assert.deepEqual(result.remaining, []);
+  }
+});
+
+test('tag addition skips tags already pointing to the requested version', async () => {
+  const result = await runPublisher({ operation: 'dist-tag-add' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+  assert.equal(parseReceipt(result.stdout).status, 'skipped');
+  assert.match(result.stdout, /tag beta already points to 1\.2\.3/);
+  assert.match(result.summary, /"status": "skipped"/);
+  assert.deepEqual(result.remaining, []);
+});
+
+test('tag addition creates missing tags and moves tags pointing to another version', async () => {
+  for (const fixture of [{ body: '{}' }, { body: '{"beta":"2.0.0"}' }, { status: 404 }]) {
+    const result = await runPublisher({ operation: 'dist-tag-add', ...fixture });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(result.effects.map(effect => effect.type), ['read', 'write']);
+    assert.deepEqual(result.effects[1].args.slice(0, 4), ['dist-tag', 'add', '@example/widget@1.2.3', 'beta']);
+    assert.equal(parseReceipt(result.stdout).status, 'completed');
+    assert.deepEqual(result.remaining, []);
+  }
+});
+
+test('failed tag lookups prevent tag addition and unversioned removal', async () => {
+  for (const operation of ['dist-tag-add', 'dist-tag-remove']) {
+    for (const fixture of [{ status: 403 }, { status: 500 }, { body: 'null' }, { body: '{"beta":42}' }]) {
+      const result = await runPublisher({ operation, ...(operation === 'dist-tag-remove' ? { version: '' } : {}), ...fixture });
+      assert.notEqual(result.status, 0);
+      assert.deepEqual(result.effects.map(effect => effect.type), ['read']);
+      assert.equal(result.summary, '');
+      assert.deepEqual(result.remaining, []);
+    }
+  }
 });
 
 test('package downloads follow redirects by default and publish the downloaded content', async () => {
