@@ -105,18 +105,38 @@ async function selectPublishTag({ name, version }) {
   return selectedTag;
 }
 
-async function tagStillTargetsVersion({ name, version, tag }) {
-  console.log(`Checking whether npm tag ${tag} points to ${name}@${version}...`);
-  const tags = await fetchJson(`${registry}-/package/${encodeURIComponent(name)}/dist-tags`, 'npm tag lookup', {
+async function shouldSkipOperation({ operation, name, version, tag }) {
+  if (operation === 'publish') {
+    console.log(`Checking whether ${name}@${version} is already published on npm...`);
+    const response = await fetch(`${registry}${encodeURIComponent(name)}/${encodeURIComponent(version)}?write=true`, {
+      method: 'HEAD',
+      headers: { 'Cache-Control': 'no-cache' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (response.status === 404) return false;
+    if (!response.ok) throw new Error(`npm version lookup failed (HTTP ${response.status}).`);
+    console.log(`Skipping publish: ${name}@${version} is already published on npm.`);
+    return true;
+  }
+
+  console.log(`Checking current npm tag ${tag} for ${name}...`);
+  const tags = await fetchJson(`${registry}-/package/${encodeURIComponent(name)}/dist-tags?write=true`, 'npm tag lookup', {
     allowNotFound: true,
   });
-  if (tags === undefined) return false;
-  if (!tags || typeof tags !== 'object' || Array.isArray(tags))
+  if (tags !== undefined && (!tags || typeof tags !== 'object' || Array.isArray(tags)))
     throw new Error('Invalid npm tag lookup response.');
-  const current = Object.hasOwn(tags, tag) ? tags[tag] : undefined;
+  const current = tags && Object.hasOwn(tags, tag) ? tags[tag] : undefined;
   if (current !== undefined && (typeof current !== 'string' || !current))
     throw new Error('Invalid npm tag lookup response.');
-  return current === version;
+  // Skip adds already at the requested version, and removals of absent tags or tags whose target differs from the supplied version.
+  const skip = operation === 'dist-tag-add'
+    ? current === version
+    : current === undefined || (!!version && current !== version);
+  if (skip && operation === 'dist-tag-remove' && current !== undefined)
+    console.log(`Skipping ${operation} for ${name}: tag ${tag} points to ${current}, expected ${version}.`);
+  else if (skip)
+    console.log(`Skipping ${operation} for ${name}: tag ${tag} ${current === undefined ? 'does not exist' : `already points to ${current}`}.`);
+  return skip;
 }
 
 async function runNpm(args) {
@@ -154,10 +174,6 @@ async function writeToNpm(request, tarball) {
   };
   const options = [`--registry=${registry}`, '--ignore-scripts', '--workspaces=false', '--loglevel=error'];
   if (name.startsWith('@')) options.push(`--${name.split('/')[0]}:registry=${registry}`);
-  if (operation === 'dist-tag-remove' && version && !await tagStillTargetsVersion({ name, version, tag })) {
-    console.log(`Skipping removal of npm tag ${tag} from ${name}: it does not point to ${version}.`);
-    return 'skipped';
-  }
   try {
     await runNpm([...commands[operation], ...options]);
     if (operation === 'publish') console.log(`Package ${name}@${version} published successfully.`);
@@ -175,11 +191,12 @@ async function main() {
   console.log(`Starting ${request.operation} for ${request.name} (stage: ${request.stage}, operation ID: ${request.operationId}).`);
   const directory = await mkdtemp(join(process.env.RUNNER_TEMP || tmpdir(), 'npm-worker-'));
   try {
+    const skip = await shouldSkipOperation(request);
     let tarball;
-    if (request.operation === 'publish') {
+    if (request.operation === 'publish' && !skip) {
       tarball = await downloadPackage(request, directory);
     }
-    const status = await writeToNpm(request, tarball);
+    const status = skip ? 'skipped' : await writeToNpm(request, tarball);
     const receipt = {
       stage: request.stage, operation_id: request.operationId, operation: request.operation,
       package: request.name, version: request.version || undefined, dist_tag: request.tag ?? null, status,
